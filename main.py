@@ -1,1086 +1,1235 @@
-from __future__ import annotations
+"""
+浏览器书签HTML转换工具
+支持将 Chrome/Edge 导出的书签 HTML 文件转换为美观的静态网页
+"""
 
-from collections import Counter
-from dataclasses import dataclass, field
-from html import escape
-from html.parser import HTMLParser
+import html
+import re
 from pathlib import Path
-from typing import Any
-from urllib.parse import quote
-
-
-DEFAULT_ICON_DATA_URI = (
-	"data:image/svg+xml;charset=UTF-8,"
-	+ quote(
-		"""
-		<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'>
-			<defs>
-				<linearGradient id='g' x1='0%' y1='0%' x2='100%' y2='100%'>
-					<stop offset='0%' stop-color='#6de2d5'/>
-					<stop offset='100%' stop-color='#9db7ff'/>
-				</linearGradient>
-			</defs>
-			<rect x='6' y='6' width='52' height='52' rx='16' fill='url(#g)'/>
-			<circle cx='24' cy='24' r='6' fill='#08111f'/>
-			<path d='M18 39c4-7 8-10 14-10s10 3 14 10' fill='none' stroke='#08111f' stroke-width='5' stroke-linecap='round'/>
-		</svg>
-		""".strip()
-	)
-)
+from typing import List, Dict
+from dataclasses import dataclass, field
 
 
 @dataclass
 class Bookmark:
-	title: str
-	href: str
-	icon: str = ""
-	add_date: str = ""
+    """书签数据结构"""
+    title: str
+    url: str
+    folder: str = ""
+    add_date: str = ""
+    icon: str = ""
+
+    @property
+    def domain(self) -> str:
+        """提取域名用于图标显示"""
+        try:
+            from urllib.parse import urlparse
+            parsed = urlparse(self.url)
+            return parsed.netloc or "unknown"
+        except:
+            return "unknown"
 
 
 @dataclass
-class Folder:
-	title: str
-	children: list[Any] = field(default_factory=list)
+class BookmarkFolder:
+    """书签文件夹"""
+    name: str
+    bookmarks: List[Bookmark] = field(default_factory=list)
+    subfolders: Dict[str, 'BookmarkFolder'] = field(default_factory=dict)
+
+    def add_bookmark(self, bookmark: Bookmark):
+        """添加书签到当前文件夹"""
+        self.bookmarks.append(bookmark)
+
+    def get_or_create_subfolder(self, name: str) -> 'BookmarkFolder':
+        """获取或创建子文件夹"""
+        if name not in self.subfolders:
+            self.subfolders[name] = BookmarkFolder(name=name)
+        return self.subfolders[name]
+
+    def count_bookmarks(self) -> int:
+        """统计所有书签数量（包括子文件夹）"""
+        count = len(self.bookmarks)
+        for subfolder in self.subfolders.values():
+            count += subfolder.count_bookmarks()
+        return count
 
 
-class BookmarksParser(HTMLParser):
-	def __init__(self) -> None:
-		super().__init__(convert_charrefs=True)
-		self.root = Folder(title="收藏夹")
-		self.stack: list[Folder] = [self.root]
-		self.pending_folder: Folder | None = None
-		self.collecting: str | None = None
-		self.buffer: list[str] = []
-		self.current_attrs: dict[str, str] = {}
+class BookmarkParser:
+    """解析浏览器导出的书签 HTML"""
 
-	def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
-		tag = tag.lower()
-		if tag == "h3":
-			self.collecting = "folder"
-			self.buffer = []
-			self.current_attrs = {k.lower(): v or "" for k, v in attrs}
-		elif tag == "a":
-			self.collecting = "bookmark"
-			self.buffer = []
-			self.current_attrs = {k.lower(): v or "" for k, v in attrs}
-		elif tag == "dl":
-			if self.pending_folder is not None:
-				self.stack.append(self.pending_folder)
-				self.pending_folder = None
+    # DT 匹配模式 - 匹配 <DT><H3> 或 <DT><A> 标签
+    DT_PATTERN = re.compile(r'<DT>(<H3[^>]*>.*?</H3>|<A[^>]*>.*?</A>)', re.IGNORECASE | re.DOTALL)
+    DL_END_PATTERN = re.compile(r'</DL>', re.IGNORECASE)
 
-	def handle_endtag(self, tag: str) -> None:
-		tag = tag.lower()
-		if tag == "h3" and self.collecting == "folder":
-			title = "".join(self.buffer).strip() or "未命名文件夹"
-			folder = Folder(title=title)
-			self.stack[-1].children.append(folder)
-			self.pending_folder = folder
-			self.collecting = None
-			self.buffer = []
-			self.current_attrs = {}
-		elif tag == "a" and self.collecting == "bookmark":
-			title = "".join(self.buffer).strip() or "未命名链接"
-			bookmark = Bookmark(
-				title=title,
-				href=self.current_attrs.get("href", ""),
-				icon=self.current_attrs.get("icon", ""),
-				add_date=self.current_attrs.get("add_date", ""),
-			)
-			self.stack[-1].children.append(bookmark)
-			self.collecting = None
-			self.buffer = []
-			self.current_attrs = {}
-		elif tag == "dl":
-			if len(self.stack) > 1:
-				self.stack.pop()
+    # 提取属性
+    HREF_ATTR = re.compile(r'HREF\s*=\s*"([^"]*)"', re.IGNORECASE)
+    ADD_DATE_ATTR = re.compile(r'ADD_DATE\s*=\s*"([^"]*)"', re.IGNORECASE)
+    ICON_ATTR = re.compile(r'ICON\s*=\s*"([^"]*)"', re.IGNORECASE)
 
-	def handle_data(self, data: str) -> None:
-		if self.collecting:
-			self.buffer.append(data)
+    def __init__(self, html_content: str):
+        self.html_content = html_content
 
+    def parse(self) -> BookmarkFolder:
+        """解析书签 HTML，返回文件夹树结构"""
+        root = BookmarkFolder(name="根目录")
+        current_folder = root
+        folder_stack = [root]
 
-def parse_bookmarks(path: Path) -> Folder:
-	parser = BookmarksParser()
-	parser.feed(path.read_text(encoding="utf-8"))
-	parser.close()
-	return parser.root
+        # 找到所有 DT 和 DL 结束标签的位置
+        positions = []
+        for match in self.DT_PATTERN.finditer(self.html_content):
+            positions.append(('DT', match.start(), match))
+        for match in self.DL_END_PATTERN.finditer(self.html_content):
+            positions.append(('DL_END', match.start(), match))
 
+        # 按位置排序
+        positions.sort(key=lambda x: x[1])
 
-def iter_nodes(folder: Folder):
-	for child in folder.children:
-		yield child
-		if isinstance(child, Folder):
-			yield from iter_nodes(child)
+        # 处理每个元素
+        for pos_type, _, match in positions:
+            if pos_type == 'DT':
+                element = match.group(1)
 
+                if element.upper().startswith('<H3'):
+                    # 开始新文件夹
+                    folder_name = self._extract_text(element)
+                    if folder_name:
+                        current_folder = current_folder.get_or_create_subfolder(folder_name)
+                        folder_stack.append(current_folder)
 
-def count_stats(root: Folder) -> tuple[int, int]:
-	folders = 0
-	bookmarks = 0
-	for node in iter_nodes(root):
-		if isinstance(node, Folder):
-			folders += 1
-		else:
-			bookmarks += 1
-	return folders, bookmarks
+                elif element.upper().startswith('<A'):
+                    # 书签链接
+                    bookmark = self._parse_link(element)
+                    if bookmark.url:
+                        bookmark.folder = current_folder.name if current_folder.name != "根目录" else ""
+                        current_folder.add_bookmark(bookmark)
 
+            elif pos_type == 'DL_END':
+                # 结束当前文件夹
+                if len(folder_stack) > 1:
+                    folder_stack.pop()
+                    current_folder = folder_stack[-1]
 
-def extract_domains(root: Folder, limit: int = 8) -> list[tuple[str, int]]:
-	counter: Counter[str] = Counter()
-	for node in iter_nodes(root):
-		if isinstance(node, Bookmark) and node.href:
-			host = node.href.split("//", 1)[-1].split("/", 1)[0].lower()
-			if host.startswith("www."):
-				host = host[4:]
-			if host:
-				counter[host] += 1
-	return counter.most_common(limit)
+        return root
+
+    def _extract_text(self, element: str) -> str:
+        """提取标签内的纯文本"""
+        # 移除 HTML 标签
+        text = re.sub(r'<[^>]+>', '', element)
+        return html.unescape(text).strip()
+
+    def _parse_link(self, element: str) -> Bookmark:
+        """解析链接元素"""
+        # 提取 URL
+        href_match = self.HREF_ATTR.search(element)
+        url = href_match.group(1) if href_match else ""
+
+        # 提取标题
+        title_match = re.search(r'>(.*?)</A>', element, re.IGNORECASE | re.DOTALL)
+        title = title_match.group(1) if title_match else url
+        title = html.unescape(re.sub(r'<[^>]+>', '', title)).strip()
+
+        # 提取添加日期
+        date_match = self.ADD_DATE_ATTR.search(element)
+        add_date = date_match.group(1) if date_match else ""
+
+        # 提取图标
+        icon_match = self.ICON_ATTR.search(element)
+        icon = icon_match.group(1) if icon_match else ""
+
+        return Bookmark(
+            title=title or "Untitled",
+            url=url,
+            add_date=add_date,
+            icon=icon
+        )
 
 
-def safe_id(text: str, index: int | str) -> str:
-	cleaned = "".join(ch.lower() if ch.isalnum() else "-" for ch in text)
-	cleaned = "-".join(part for part in cleaned.split("-") if part)
-	return cleaned or f"section-{index}"
+class StaticPageGenerator:
+    """生成静态网页 HTML"""
 
+    def __init__(self, folder: BookmarkFolder, title: str = "我的书签"):
+        self.folder = folder
+        self.title = title
+        self.total_bookmarks = folder.count_bookmarks()
 
-def folder_anchor(folder: Folder, path: tuple[int, ...]) -> str:
-	path_suffix = "-".join(str(part) for part in path) or "root"
-	return safe_id(f"{folder.title}-{path_suffix}", path_suffix)
+    def generate(self, output_path: str):
+        """生成静态网页"""
+        html_content = self._build_html()
+        Path(output_path).write_text(html_content, encoding='utf-8')
 
-
-def split_folder_children(folder: Folder) -> tuple[list[Bookmark], list[Folder]]:
-	bookmark_nodes: list[Bookmark] = []
-	folder_nodes: list[Folder] = []
-	for child in folder.children:
-		if isinstance(child, Bookmark):
-			bookmark_nodes.append(child)
-		elif isinstance(child, Folder):
-			folder_nodes.append(child)
-	return bookmark_nodes, folder_nodes
-
-
-def favicon_url(bookmark: Bookmark) -> str:
-	if bookmark.icon:
-		return bookmark.icon
-	if not bookmark.href:
-		return DEFAULT_ICON_DATA_URI
-	return f"https://www.google.com/s2/favicons?sz=64&domain_url={bookmark.href}"
-
-
-def render_bookmark(bookmark: Bookmark) -> str:
-	icon_src = favicon_url(bookmark)
-	domain = bookmark.href.split("//", 1)[-1].split("/", 1)[0].lower() if bookmark.href else ""
-	label = domain[4:] if domain.startswith("www.") else domain
-	return f"""
-		<a class="bookmark-card" href="{escape(bookmark.href, quote=True)}" target="_blank" rel="noopener noreferrer" data-search="{escape((bookmark.title + ' ' + bookmark.href + ' ' + label), quote=True)}">
-			<span class="bookmark-icon">
-				<img class="bookmark-favicon" src="{escape(icon_src, quote=True)}" alt="" loading="lazy" decoding="async">
-			</span>
-			<span class="bookmark-body">
-				<span class="bookmark-title">{escape(bookmark.title)}</span>
-				<span class="bookmark-meta">{escape(label or 'direct link')}</span>
-			</span>
-		</a>
-	"""
-
-
-def render_folder_nav(folder: Folder, path: tuple[int, ...] = (), level: int = 0) -> str:
-	bookmark_nodes, folder_nodes = split_folder_children(folder)
-	if not folder_nodes:
-		return ""
-	items: list[str] = []
-	for child_index, child in enumerate(folder_nodes):
-		child_path = path + (child_index,)
-		child_id = folder_anchor(child, child_path)
-		child_nav = render_folder_nav(child, child_path, level + 1)
-		toggle_button = ""
-		children_html = ""
-		if child_nav:
-			toggle_button = f"""
-				<button class="nav-fold-toggle" type="button" aria-expanded="true" aria-label="折叠 {escape(child.title)}" data-folder-title="{escape(child.title, quote=True)}">
-					<span aria-hidden="true">▾</span>
-				</button>
-			"""
-			children_html = f'<div class="nav-children">{child_nav}</div>'
-		items.append(
-			f"""
-			<div class="nav-item level-{level + 1}" data-nav-id="{child_id}" data-collapsed="false">
-				<div class="nav-row">
-					{toggle_button}
-					<a class="nav-link" href="#{child_id}">
-						<span>{escape(child.title)}</span>
-						<em>{sum(isinstance(node, Bookmark) for node in child.children)} 个链接</em>
-					</a>
-				</div>
-				{children_html}
-			</div>
-			"""
-		)
-	return f"<div class=\"nav-tree\">{''.join(items)}</div>"
-
-
-def render_sidebar(root: Folder) -> str:
-	return f"""
-		<div class="sidebar-card">
-			<button id="sidebarToggle" class="sidebar-toggle" type="button" aria-expanded="true" aria-label="折叠侧边导航栏">
-				<span class="sidebar-toggle-icon">⟨</span>
-				<span class="sidebar-toggle-text">收起</span>
-			</button>
-			<div class="sidebar-main">
-				<p class="sidebar-kicker">文件夹导航</p>
-				<h2>快速跳转</h2>
-				<p class="sidebar-note">点击左侧文件夹，直接定位到对应收藏分组。</p>
-				<a class="sidebar-home" href="#content">回到顶部收藏</a>
-				{render_folder_nav(root)}
-			</div>
-		</div>
-	"""
-
-
-def render_folder(folder: Folder, level: int = 0, path: tuple[int, ...] = ()) -> tuple[str, int]:
-	folder_id = folder_anchor(folder, path)
-	bookmark_nodes, folder_nodes = split_folder_children(folder)
-	html_parts: list[str] = []
-
-	if level > 0 or folder.title != "收藏夹":
-		html_parts.append(
-			f"""
-			<section class="folder-card level-{level}" id="{folder_id}" data-search="{escape(folder.title, quote=True)}">
-				<div class="folder-head">
-					<div>
-						<p class="folder-kicker">收藏分组</p>
-						<h2>{escape(folder.title)}</h2>
-						<p class="folder-count">{len(bookmark_nodes)} 个链接 · {len(folder_nodes)} 个子分组</p>
-					</div>
-					<button class="folder-toggle" type="button" aria-expanded="true">收起</button>
-				</div>
-				<div class="folder-body">
-			"""
-		)
-
-	if bookmark_nodes:
-		html_parts.append('<div class="bookmark-grid">')
-		for bookmark in bookmark_nodes:
-			html_parts.append(render_bookmark(bookmark))
-		html_parts.append('</div>')
-
-	for child_index, child in enumerate(folder_nodes):
-		child_html, _ = render_folder(child, level + 1, path + (child_index,))
-		html_parts.append(child_html)
-
-	if level > 0 or folder.title != "收藏夹":
-		html_parts.append('</div></section>')
-
-	return "".join(html_parts), 0
-
-
-def render_feature_tags(domains: list[tuple[str, int]]) -> str:
-	if not domains:
-		return ""
-	chips = "".join(
-		f'<span class="chip"><strong>{escape(name)}</strong><em>{count}</em></span>'
-		for name, count in domains
-	)
-	return f"<div class=\"chip-row\">{chips}</div>"
-
-
-def build_html(root: Folder, source_name: str) -> str:
-	folders, bookmarks = count_stats(root)
-	domains = extract_domains(root)
-	content_html, _ = render_folder(root)
-	total_nodes = bookmarks + folders
-	title = f"{root.title} · 导航站"
-	return f"""<!doctype html>
+    def _build_html(self) -> str:
+        """构建完整的 HTML 页面"""
+        return f'''<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
-	<meta charset="utf-8">
-	<meta name="viewport" content="width=device-width, initial-scale=1">
-	<meta name="color-scheme" content="dark light">
-	<title>{escape(title)}</title>
-	<style>
-		:root {{
-			--bg: #08111f;
-			--bg-2: #0d1a2c;
-			--card: rgba(10, 18, 33, 0.56);
-			--card-strong: rgba(17, 27, 47, 0.82);
-			--line: rgba(255, 255, 255, 0.08);
-			--text: #ecf2ff;
-			--muted: rgba(236, 242, 255, 0.72);
-			--accent: #6de2d5;
-			--accent-2: #9db7ff;
-			--accent-3: #f1c27d;
-			--shadow: 0 24px 80px rgba(0, 0, 0, 0.35);
-		}}
-		* {{ box-sizing: border-box; }}
-		html {{ scroll-behavior: smooth; }}
-		body {{
-			margin: 0;
-			color: var(--text);
-			background:
-				radial-gradient(circle at top left, rgba(109, 226, 213, 0.18), transparent 26%),
-				radial-gradient(circle at top right, rgba(157, 183, 255, 0.16), transparent 24%),
-				radial-gradient(circle at bottom left, rgba(241, 194, 125, 0.12), transparent 24%),
-				linear-gradient(135deg, var(--bg), var(--bg-2));
-			font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-			min-height: 100vh;
-		}}
-		body::before {{
-			content: "";
-			position: fixed;
-			inset: 0;
-			pointer-events: none;
-			background-image: linear-gradient(rgba(255, 255, 255, 0.03) 1px, transparent 1px), linear-gradient(90deg, rgba(255, 255, 255, 0.03) 1px, transparent 1px);
-			background-size: 72px 72px;
-			mask-image: linear-gradient(to bottom, rgba(0, 0, 0, 0.28), transparent 72%);
-			opacity: 0.5;
-		}}
-		a {{ color: inherit; text-decoration: none; }}
-		.shell {{ max-width: 1460px; margin: 0 auto; padding: 28px 20px 60px; position: relative; z-index: 1; }}
-		.hero {{
-			position: relative;
-			overflow: hidden;
-			border: 1px solid var(--line);
-			border-radius: 28px;
-			background: linear-gradient(180deg, rgba(19, 31, 54, 0.8), rgba(11, 18, 33, 0.6));
-			box-shadow: var(--shadow);
-			backdrop-filter: blur(18px);
-			padding: 28px;
-		}}
-		.hero::after {{
-			content: "";
-			position: absolute;
-			inset: auto -120px -160px auto;
-			width: 320px;
-			height: 320px;
-			border-radius: 50%;
-			background: radial-gradient(circle, rgba(109, 226, 213, 0.22), transparent 68%);
-			filter: blur(12px);
-		}}
-		.eyebrow {{
-			display: inline-flex;
-			align-items: center;
-			gap: 10px;
-			padding: 8px 14px;
-			border-radius: 999px;
-			background: rgba(255, 255, 255, 0.06);
-			border: 1px solid var(--line);
-			color: var(--muted);
-			font-size: 13px;
-			letter-spacing: 0.04em;
-			text-transform: uppercase;
-		}}
-		.hero h1 {{ margin: 18px 0 8px; font-size: clamp(30px, 4vw, 56px); line-height: 1.04; }}
-		.hero p {{ margin: 0; color: var(--muted); max-width: 72ch; line-height: 1.8; }}
-		.web-search {{
-			margin-top: 22px;
-			display: grid;
-			grid-template-columns: minmax(0, 1.4fr) 220px auto;
-			gap: 12px;
-			padding: 16px;
-			border: 1px solid rgba(109, 226, 213, 0.18);
-			background: linear-gradient(135deg, rgba(255, 255, 255, 0.06), rgba(109, 226, 213, 0.08));
-			backdrop-filter: blur(16px);
-			border-radius: 24px;
-			box-shadow: var(--shadow);
-			position: relative;
-			z-index: 10;
-		}}
-		.web-search-field, .web-search-select, .web-search-submit {{
-			display: flex;
-			align-items: center;
-			gap: 12px;
-			min-width: 0;
-			border: 1px solid rgba(255, 255, 255, 0.08);
-			background: rgba(7, 14, 26, 0.48);
-			border-radius: 18px;
-			padding: 14px 16px;
-		}}
-		.web-search-field input, .web-search-select select {{
-			width: 100%;
-			border: 0;
-			outline: 0;
-			background: transparent;
-			color: var(--text);
-			font-size: 15px;
-			min-width: 0;
-		}}
-		.web-search-field input::placeholder {{ color: rgba(236, 242, 255, 0.48); }}
-		.web-search-select {{
-			position: relative;
-			justify-content: space-between;
-			padding-right: 42px;
-			cursor: pointer;
-			background: rgba(7, 14, 26, 0.48) !important;
-			border: 1px solid rgba(255, 255, 255, 0.08) !important;
-			z-index: 20;
-		}}
-		.web-search-select::after {{
-			content: "▾";
-			position: absolute;
-			right: 16px;
-			top: 50%;
-			transform: translateY(-50%);
-			color: var(--accent);
-			font-size: 12px;
-			pointer-events: none;
-			transition: transform 160ms ease;
-		}}
-		.web-search-select[data-open="true"]::after {{
-			transform: translateY(-50%) rotate(180deg);
-		}}
-		.web-search-select:focus-within {{
-			border-color: rgba(109, 226, 213, 0.42) !important;
-			background: rgba(15, 24, 41, 0.78) !important;
-			box-shadow: 0 0 0 3px rgba(109, 226, 213, 0.1);
-		}}
-		.web-search-select:hover {{
-			border-color: rgba(109, 226, 213, 0.28) !important;
-			background: rgba(15, 24, 41, 0.68) !important;
-		}}
-		.web-search-select span {{ color: var(--muted); font-size: 13px; flex: 0 0 auto; }}
-		.web-search-select select {{ appearance: none; cursor: pointer; padding-right: 8px; flex: 1; opacity: 0; width: 100%; pointer-events: none; }}
-		.search-engine-dropdown {{
-			position: fixed;
-			background: rgba(8, 17, 31, 0.95);
-			border: 1px solid rgba(109, 226, 213, 0.28);
-			border-radius: 16px;
-			box-shadow: 0 12px 48px rgba(0, 0, 0, 0.48);
-			backdrop-filter: blur(18px);
-			min-width: 180px;
-			display: none;
-			z-index: 10000;
-			overflow: hidden;
-			max-height: 320px;
-			overflow-y: auto;
-		}}
-		.search-engine-dropdown[data-visible="true"] {{
-			display: grid;
-		}}
-		.search-engine-item {{
-			padding: 12px 16px;
-			cursor: pointer;
-			display: flex;
-			align-items: center;
-			gap: 12px;
-			border: none;
-			background: transparent;
-			color: var(--text);
-			width: 100%;
-			text-align: left;
-			font-size: 14px;
-			transition: background 120ms ease, color 120ms ease;
-			border-left: 3px solid transparent;
-		}}
-		.search-engine-item:hover {{
-			background: rgba(109, 226, 213, 0.12);
-			color: var(--accent);
-		}}
-		.search-engine-item[data-selected="true"] {{
-			background: rgba(109, 226, 213, 0.18);
-			color: var(--accent);
-			border-left-color: var(--accent);
-		}}
-		.search-engine-item::before {{
-			content: "";
-			display: inline-block;
-			width: 8px;
-			height: 8px;
-			border-radius: 50%;
-			background: currentColor;
-			opacity: 0.6;
-		}}
-		.search-engine-item[data-selected="true"]::before {{
-			background: var(--accent);
-			opacity: 1;
-			width: 10px;
-			height: 10px;
-		}}
-		.web-search-submit {{
-			justify-content: center;
-			border: 1px solid rgba(109, 226, 213, 0.24);
-			background: linear-gradient(135deg, rgba(109, 226, 213, 0.18), rgba(157, 183, 255, 0.16));
-			color: var(--text);
-			font-weight: 600;
-			cursor: pointer;
-			transition: transform 160ms ease, border-color 160ms ease, background 160ms ease;
-			box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.08);
-		}}
-		.web-search-submit:hover {{ transform: translateY(-1px); border-color: rgba(109, 226, 213, 0.42); background: linear-gradient(135deg, rgba(109, 226, 213, 0.24), rgba(157, 183, 255, 0.22)); }}
-		.toolbar {{
-			margin-top: 22px;
-			display: grid;
-			grid-template-columns: minmax(0, 1.4fr) repeat(3, minmax(0, 0.5fr));
-			gap: 14px;
-		}}
-		.search, .stat {{
-			border: 1px solid var(--line);
-			background: var(--card);
-			backdrop-filter: blur(16px);
-			border-radius: 22px;
-			box-shadow: var(--shadow);
-		}}
-		.search {{ padding: 16px 18px; display: flex; align-items: center; gap: 12px; }}
-		.search input {{
-			width: 100%;
-			border: 0;
-			outline: 0;
-			background: transparent;
-			color: var(--text);
-			font-size: 16px;
-		}}
-		.search input::placeholder {{ color: rgba(236, 242, 255, 0.45); }}
-		.stat {{ padding: 16px 18px; display: grid; gap: 4px; align-content: center; }}
-		.stat span {{ color: var(--muted); font-size: 12px; }}
-		.stat strong {{ font-size: 24px; line-height: 1; }}
-		.chip-row {{ margin-top: 16px; display: flex; flex-wrap: wrap; gap: 10px; }}
-		.chip {{
-			display: inline-flex;
-			gap: 10px;
-			align-items: center;
-			padding: 10px 14px;
-			border-radius: 999px;
-			border: 1px solid var(--line);
-			background: rgba(255, 255, 255, 0.05);
-			backdrop-filter: blur(12px);
-		}}
-		.chip strong {{ font-size: 14px; }}
-		.chip em {{ font-style: normal; color: var(--muted); }}
-		.layout {{ --sidebar-width: 320px; margin-top: 24px; display: grid; grid-template-columns: var(--sidebar-width) minmax(0, 1fr); gap: 18px; align-items: start; }}
-		.layout[data-sidebar-collapsed="true"] {{ --sidebar-width: 88px; }}
-		.sidebar {{ position: sticky; top: 24px; align-self: start; }}
-		.sidebar-card {{
-			border: 1px solid var(--line);
-			border-radius: 24px;
-			background: rgba(8, 17, 31, 0.78);
-			backdrop-filter: blur(18px);
-			box-shadow: var(--shadow);
-			padding: 20px;
-			max-height: calc(100vh - 48px);
-			overflow: auto;
-			scrollbar-width: thin;
-			scrollbar-color: rgba(109, 226, 213, 0.55) rgba(255, 255, 255, 0.06);
-		}}
-		.sidebar-card::-webkit-scrollbar {{ width: 10px; }}
-		.sidebar-card::-webkit-scrollbar-track {{ background: rgba(255, 255, 255, 0.04); border-radius: 999px; }}
-		.sidebar-card::-webkit-scrollbar-thumb {{
-			background: linear-gradient(180deg, rgba(109, 226, 213, 0.8), rgba(157, 183, 255, 0.8));
-			border-radius: 999px;
-			border: 2px solid rgba(8, 17, 31, 0.78);
-		}}
-		.sidebar-card::-webkit-scrollbar-thumb:hover {{
-			background: linear-gradient(180deg, rgba(109, 226, 213, 1), rgba(157, 183, 255, 1));
-		}}
-		.sidebar-toggle {{
-			display: inline-flex;
-			align-items: center;
-			justify-content: center;
-			gap: 8px;
-			width: 100%;
-			padding: 10px 14px;
-			border: 1px solid rgba(109, 226, 213, 0.22);
-			border-radius: 16px;
-			background: linear-gradient(135deg, rgba(109, 226, 213, 0.12), rgba(157, 183, 255, 0.1));
-			color: var(--text);
-			cursor: pointer;
-			box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.08);
-		}}
-		.sidebar-toggle:hover {{ border-color: rgba(109, 226, 213, 0.4); background: linear-gradient(135deg, rgba(109, 226, 213, 0.18), rgba(157, 183, 255, 0.16)); }}
-		.sidebar-toggle-icon {{ font-size: 14px; line-height: 1; }}
-		.sidebar-toggle-text {{ font-size: 13px; letter-spacing: 0.04em; }}
-		.sidebar-main {{ display: grid; gap: 0; margin-top: 18px; }}
-		.layout[data-sidebar-collapsed="true"] .sidebar-card {{ padding: 14px 10px; }}
-		.layout[data-sidebar-collapsed="true"] .sidebar-main {{ display: none; }}
-		.layout[data-sidebar-collapsed="true"] .sidebar-toggle {{ padding: 12px 10px; border-radius: 18px; }}
-		.layout[data-sidebar-collapsed="true"] .sidebar-toggle-text {{ display: none; }}
-		.layout[data-sidebar-collapsed="true"] .sidebar-toggle-icon {{ transform: rotate(180deg); }}
-		.sidebar-kicker {{ margin: 0 0 6px; color: var(--accent); font-size: 12px; letter-spacing: 0.16em; text-transform: uppercase; }}
-		.sidebar-card h2 {{ margin: 0; font-size: 22px; }}
-		.sidebar-note {{ margin-top: 10px; color: var(--muted); line-height: 1.7; font-size: 14px; }}
-		.sidebar-home {{
-			display: inline-flex;
-			margin-top: 16px;
-			padding: 10px 14px;
-			border-radius: 999px;
-			border: 1px solid var(--line);
-			background: rgba(255, 255, 255, 0.05);
-			font-size: 13px;
-		}}
-		.nav-list {{ list-style: none; padding: 14px 0 0; margin: 0; display: grid; gap: 10px; }}
-		.nav-list-nested {{ padding-left: 16px; border-left: 1px solid rgba(255, 255, 255, 0.08); }}
-		.nav-item {{ display: grid; gap: 10px; }}
-		.nav-row {{ display: flex; align-items: stretch; gap: 10px; min-width: 0; }}
-		.nav-fold-toggle {{
-			width: 34px;
-			min-width: 34px;
-			height: 34px;
-			border: 1px solid rgba(255, 255, 255, 0.08);
-			border-radius: 12px;
-			background: rgba(255, 255, 255, 0.05);
-			color: var(--text);
-			cursor: pointer;
-			display: inline-grid;
-			place-items: center;
-			padding: 0;
-			flex: 0 0 auto;
-			transition: background 160ms ease, border-color 160ms ease, transform 160ms ease;
-		}}
-		.nav-fold-toggle:hover {{ border-color: rgba(109, 226, 213, 0.34); background: rgba(15, 24, 41, 0.78); transform: translateY(-1px); }}
-		.nav-fold-toggle span {{ display: inline-block; transition: transform 160ms ease; line-height: 1; }}
-		.nav-link {{
-			display: flex;
-			justify-content: space-between;
-			gap: 12px;
-			align-items: center;
-			padding: 12px 14px;
-			border-radius: 16px;
-			border: 1px solid transparent;
-			background: rgba(255, 255, 255, 0.04);
-			transition: background 160ms ease, border-color 160ms ease, transform 160ms ease;
-		}}
-		.nav-link span {{ min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }}
-		.nav-link em {{ font-style: normal; color: var(--muted); font-size: 12px; flex: 0 0 auto; }}
-		.nav-link:hover {{ border-color: rgba(109, 226, 213, 0.28); background: rgba(15, 24, 41, 0.82); transform: translateX(2px); }}
-		.nav-children {{ margin-left: 17px; padding-left: 14px; border-left: 1px solid rgba(255, 255, 255, 0.08); display: grid; gap: 10px; }}
-		.nav-item[data-collapsed="true"] > .nav-children {{ display: none; }}
-		.nav-item[data-collapsed="true"] > .nav-row .nav-fold-toggle span {{ transform: rotate(-90deg); }}
-		.nav-item[data-collapsed="true"] > .nav-row .nav-fold-toggle {{ border-color: rgba(109, 226, 213, 0.28); background: rgba(109, 226, 213, 0.12); color: var(--accent); }}
-		.content {{ display: grid; gap: 18px; }}
-		.folder-card {{
-			border: 1px solid var(--line);
-			border-radius: 24px;
-			background: var(--card);
-			backdrop-filter: blur(18px);
-			box-shadow: var(--shadow);
-			overflow: hidden;
-		}}
-		.folder-head {{
-			display: flex;
-			justify-content: space-between;
-			gap: 18px;
-			align-items: center;
-			padding: 18px 20px;
-			background: linear-gradient(180deg, rgba(255, 255, 255, 0.05), rgba(255, 255, 255, 0.01));
-			border-bottom: 1px solid rgba(255, 255, 255, 0.06);
-		}}
-		.folder-kicker {{ margin: 0 0 4px; color: var(--accent); font-size: 12px; letter-spacing: 0.16em; text-transform: uppercase; }}
-		.folder-head h2 {{ margin: 0; font-size: 22px; }}
-		.folder-count {{ margin: 6px 0 0; color: var(--muted); font-size: 13px; }}
-		.folder-toggle {{
-			border: 0;
-			padding: 10px 14px;
-			border-radius: 999px;
-			color: var(--text);
-			background: rgba(255, 255, 255, 0.08);
-			cursor: pointer;
-		}}
-		.folder-body {{ padding: 18px 20px 22px; }}
-		.bookmark-grid {{
-			display: grid;
-			grid-template-columns: repeat(auto-fill, minmax(230px, 1fr));
-			gap: 14px;
-		}}
-		.bookmark-card {{
-			display: flex;
-			gap: 12px;
-			align-items: center;
-			min-height: 82px;
-			padding: 14px;
-			border-radius: 18px;
-			border: 1px solid rgba(255, 255, 255, 0.08);
-			background: rgba(7, 14, 26, 0.48);
-			transition: transform 160ms ease, border-color 160ms ease, background 160ms ease;
-		}}
-		.bookmark-card:hover {{ transform: translateY(-3px); border-color: rgba(109, 226, 213, 0.35); background: rgba(15, 24, 41, 0.78); }}
-		.bookmark-icon {{
-			width: 40px;
-			height: 40px;
-			border-radius: 12px;
-			flex: 0 0 40px;
-			overflow: hidden;
-			display: grid;
-			place-items: center;
-			font-weight: 700;
-			color: #08111f;
-			background: linear-gradient(135deg, var(--accent), var(--accent-2));
-			box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.45);
-		}}
-		.bookmark-favicon {{ width: 100%; height: 100%; display: block; object-fit: cover; }}
-		.bookmark-favicon.is-default {{ padding: 7px; object-fit: contain; }}
-		.bookmark-body {{ min-width: 0; display: grid; gap: 4px; }}
-		.bookmark-title {{ font-size: 14px; line-height: 1.45; word-break: break-word; }}
-		.bookmark-meta {{ color: var(--muted); font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }}
-		.folder-card, .sidebar-card {{ scroll-margin-top: 24px; }}
-		.folder-card[data-collapsed="true"] > .folder-body {{ display: none; }}
-		.folder-card[data-collapsed="true"] > .folder-head .folder-toggle {{ background: rgba(109, 226, 213, 0.16); color: var(--accent); }}
-		.folder-card.level-1 {{ background: var(--card-strong); }}
-		.folder-card.level-2 {{ background: rgba(10, 18, 33, 0.68); }}
-		.folder-card.level-3 {{ background: rgba(10, 18, 33, 0.76); }}
-		.empty {{
-			margin-top: 18px;
-			padding: 28px;
-			text-align: center;
-			border: 1px dashed rgba(255, 255, 255, 0.14);
-			border-radius: 22px;
-			color: var(--muted);
-		}}
-		footer {{ margin-top: 24px; color: var(--muted); font-size: 13px; text-align: center; }}
-		@media (max-width: 1100px) {{
-			.toolbar {{ grid-template-columns: 1fr 1fr; }}
-			.search {{ grid-column: 1 / -1; }}
-			.layout {{ grid-template-columns: 1fr; }}
-			.sidebar {{ position: static; }}
-			.sidebar-card {{ max-height: none; }}
-			.layout[data-sidebar-collapsed="true"] {{ --sidebar-width: 1fr; }}
-			.layout[data-sidebar-collapsed="true"] .sidebar-card {{ padding: 16px; }}
-			.layout[data-sidebar-collapsed="true"] .sidebar-main {{ display: grid; }}
-			.layout[data-sidebar-collapsed="true"] .sidebar-toggle-text {{ display: inline; }}
-			.layout[data-sidebar-collapsed="true"] .sidebar-toggle-icon {{ transform: none; }}
-		}}
-		@media (max-width: 700px) {{
-			.shell {{ padding: 14px 12px 28px; }}
-			.hero {{ padding: 20px; border-radius: 22px; }}
-			.toolbar {{ grid-template-columns: 1fr; }}
-			.folder-head {{ align-items: flex-start; flex-direction: column; }}
-			.bookmark-grid {{ grid-template-columns: 1fr; }}
-			.layout {{ margin-top: 18px; }}
-			.sidebar-card {{ padding: 16px; }}
-		}}
-	</style>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{self.title}</title>
+    <style>{self._get_css()}</style>
 </head>
 <body>
-	<main class="shell">
-		<section class="hero">
-			<div class="eyebrow">Edge Favorites Import · {escape(source_name)}</div>
-			<h1>{escape(root.title)} 的简约导航站</h1>
-			<p>把收藏夹整理成一个可直接打开的静态导航页，支持层级分组、快速搜索和毛玻璃视觉风格，方便日常检索与跳转。</p>
-			<form class="web-search" id="webSearchForm">
-				<label class="web-search-field" aria-label="网页搜索关键词">
-					<span>⌕</span>
-					<input id="webSearchInput" type="search" placeholder="搜索网页、资料或网站">
-				</label>
-				<div class="web-search-select" id="searchEngineSelector" data-open="false" aria-label="选择搜索引擎">
-					<span>搜索引擎</span>
-					<div id="selectedEngine">Bing</div>
-					<select id="webSearchEngine" style="display: none;">
-						<option value="bing" selected>Bing</option>
-						<option value="google">Google</option>
-						<option value="baidu">百度</option>
-					</select>
-					<div class="search-engine-dropdown" id="searchEngineDropdown" data-visible="false">
-						<button type="button" class="search-engine-item" data-value="bing" data-selected="true" data-label="Bing">Bing</button>
-						<button type="button" class="search-engine-item" data-value="google" data-label="Google">Google</button>
-						<button type="button" class="search-engine-item" data-value="baidu" data-label="百度">百度</button>
-					</div>
-				</div>
-				<button class="web-search-submit" type="submit">搜索网页</button>
-			</form>
-			<div class="toolbar">
-				<label class="search" aria-label="搜索收藏">
-					<span>⌕</span>
-					<input id="searchInput" type="search" placeholder="搜索标题、网址或分组名称">
-				</label>
-				<div class="stat"><span>收藏总数</span><strong>{bookmarks}</strong></div>
-				<div class="stat"><span>分组数量</span><strong>{folders}</strong></div>
-				<div class="stat"><span>节点总数</span><strong>{total_nodes}</strong></div>
-			</div>
-			{render_feature_tags(domains)}
-		</section>
+    <div class="container">
+        <header>
+            <div class="header-top">
+                <h1>📚 {self.title}</h1>
+                <div class="stats">
+                    <span class="stat-item">📁 {self._count_folders(self.folder)}</span>
+                    <span class="stat-item">🔗 {self.total_bookmarks}</span>
+                </div>
+            </div>
 
-		<section class="layout" data-sidebar-collapsed="false">
-			<aside class="sidebar">
-				{render_sidebar(root)}
-			</aside>
-			<section id="content" class="content">
-				{content_html}
-			</section>
-		</section>
+            <div class="web-search-container">
+                <div class="web-search-box">
+                    <select id="engineSelect" class="engine-select" onchange="switchEngine(this.value)">
+                        <option value="google">谷歌</option>
+                        <option value="bing">必应</option>
+                        <option value="baidu">百度</option>
+                        <option value="sogou">搜狗</option>
+                        <option value="duckduckgo">DuckDuckGo</option>
+                    </select>
+                    <input type="text" id="webSearchInput" placeholder="🌐 网页搜索..." onkeypress="handleWebSearchKeypress(event)">
+                    <button class="search-btn" onclick="performWebSearch()">🔍</button>
+                </div>
+            </div>
 
-		<footer>生成于 {escape(source_name)} · 可直接双击打开，无需服务器</footer>
-	</main>
-	<script>
-		const input = document.getElementById('searchInput');
-		const webSearchForm = document.getElementById('webSearchForm');
-		const webSearchInput = document.getElementById('webSearchInput');
-		const webSearchEngine = document.getElementById('webSearchEngine');
-		const searchEngineSelector = document.getElementById('searchEngineSelector');
-		const selectedEngineDisplay = document.getElementById('selectedEngine');
-		const searchEngineDropdown = document.getElementById('searchEngineDropdown');
-		const searchEngineItems = Array.from(searchEngineDropdown.querySelectorAll('.search-engine-item'));
-		const folders = Array.from(document.querySelectorAll('.folder-card'));
-		const navItems = Array.from(document.querySelectorAll('.nav-item[data-nav-id]'));
-		const layout = document.querySelector('.layout');
-				const webSearchUrls = {{
-					bing: 'https://www.bing.com/search?q=',
-					google: 'https://www.google.com/search?q=',
-					baidu: 'https://www.baidu.com/s?wd=',
-				}};
-		const sidebarToggle = document.getElementById('sidebarToggle');
-		const defaultIconSrc = '{escape(DEFAULT_ICON_DATA_URI, quote=True)}';
-		const sidebarStateKey = 'favorite-navigation-sidebar-collapsed';
-		const navStatePrefix = 'favorite-navigation-nav-collapsed:';
-		const searchEngineDropdownGap = 8;
-		const searchEngineDropdownWidth = 220;
+            <div class="bookmark-search-box">
+                <input type="text" id="searchInput" placeholder="🔍 搜索书签..." oninput="handleSearch(this.value)">
+                <button id="clearSearch" class="clear-btn" onclick="clearSearch()" style="display:none;">✕</button>
+            </div>
+        </header>
 
-		// Search engine dropdown handlers
-		function positionSearchEngineDropdown() {{
-			const rect = searchEngineSelector.getBoundingClientRect();
-			const availableRight = Math.max(window.innerWidth - rect.left - 16, searchEngineDropdownWidth);
-			searchEngineDropdown.style.position = 'fixed';
-			searchEngineDropdown.style.left = `${{Math.max(12, rect.left)}}px`;
-			searchEngineDropdown.style.top = `${{rect.bottom + searchEngineDropdownGap}}px`;
-			searchEngineDropdown.style.width = `${{Math.max(rect.width, searchEngineDropdownWidth, availableRight)}}px`;
-		}}
+        <div class="layout-wrapper">
+            <nav class="sidebar">
+                <div class="sidebar-header">
+                    <h3>📂 文件夹导航</h3>
+                    <button class="collapse-all-btn" onclick="collapseAllNav()">全部折叠</button>
+                    <button class="expand-all-btn" onclick="expandAllNav()">全部展开</button>
+                </div>
+                <ul class="nav-list">
+                    {self._generate_nav_items(self.folder, 0)}
+                </ul>
+            </nav>
 
-		function ensureSearchEngineDropdownPortal() {{
-			if (searchEngineDropdown.parentElement !== document.body) {{
-				document.body.appendChild(searchEngineDropdown);
-			}}
-		}}
+            <main class="content">
+                <div id="searchResults" class="search-results" style="display:none;">
+                    <div class="search-results-header">
+                        <h2>🔍 搜索结果</h2>
+                        <button onclick="clearSearch()">关闭</button>
+                    </div>
+                    <div id="searchResultsContent" class="search-results-content"></div>
+                </div>
 
-		function openSearchEngineDropdown() {{
-			ensureSearchEngineDropdownPortal();
-			positionSearchEngineDropdown();
-			searchEngineSelector.dataset.open = 'true';
-			searchEngineDropdown.dataset.visible = 'true';
-		}}
+                <div id="mainContent">
+                    {self._generate_content(self.folder)}
+                </div>
+            </main>
+        </div>
 
-		function closeSearchEngineDropdown() {{
-			searchEngineSelector.dataset.open = 'false';
-			searchEngineDropdown.dataset.visible = 'false';
-		}}
+    </div>
 
-		// Click on the selector to open/close dropdown
-		searchEngineSelector.addEventListener('click', (e) => {{
-			e.preventDefault();
-			e.stopPropagation();
-			const isOpen = searchEngineDropdown.dataset.visible === 'true';
-			if (isOpen) {{
-				closeSearchEngineDropdown();
-			}} else {{
-				openSearchEngineDropdown();
-			}}
-		}});
-
-		searchEngineItems.forEach((item) => {{
-			item.addEventListener('click', (e) => {{
-				e.preventDefault();
-				e.stopPropagation();
-				const value = item.dataset.value;
-				const label = item.dataset.label;
-				
-				// Update select element
-				webSearchEngine.value = value;
-				
-				// Update display
-				selectedEngineDisplay.textContent = label;
-				
-				// Update UI states
-				searchEngineItems.forEach((i) => {{
-					i.dataset.selected = i === item ? 'true' : 'false';
-				}});
-				
-				closeSearchEngineDropdown();
-			}});
-		}});
-
-		// Close dropdown when clicking outside
-		document.addEventListener('click', (e) => {{
-			if (!searchEngineSelector.contains(e.target) && !searchEngineDropdown.contains(e.target)) {{
-				closeSearchEngineDropdown();
-			}}
-		}});
-
-		// Close dropdown on Escape key
-		document.addEventListener('keydown', (e) => {{
-			if (e.key === 'Escape') {{
-				closeSearchEngineDropdown();
-			}}
-		}});
-
-		// Handle window resize to reposition dropdown
-		window.addEventListener('resize', () => {{
-			if (searchEngineDropdown.dataset.visible === 'true') {{
-				positionSearchEngineDropdown();
-			}}
-		}});
-
-		window.addEventListener('scroll', () => {{
-			if (searchEngineDropdown.dataset.visible === 'true') {{
-				positionSearchEngineDropdown();
-			}}
-		}}, true);
-
-		function normalize(value) {{
-			return (value || '').toLowerCase().trim();
-		}}
-
-		function setSidebarCollapsed(collapsed) {{
-			layout.dataset.sidebarCollapsed = collapsed ? 'true' : 'false';
-			sidebarToggle.setAttribute('aria-expanded', String(!collapsed));
-			sidebarToggle.querySelector('.sidebar-toggle-text').textContent = collapsed ? '展开' : '收起';
-			sidebarToggle.querySelector('.sidebar-toggle-icon').textContent = collapsed ? '⟩' : '⟨';
-			try {{
-				localStorage.setItem(sidebarStateKey, String(collapsed));
-			}} catch (error) {{
-				void error;
-			}}
-		}}
-
-		try {{
-			setSidebarCollapsed(localStorage.getItem(sidebarStateKey) === 'true');
-		}} catch (error) {{
-			void error;
-		}}
-
-		sidebarToggle.addEventListener('click', () => {{
-			setSidebarCollapsed(layout.dataset.sidebarCollapsed !== 'true');
-		}});
-
-		function navStateKey(navId) {{
-			return navStatePrefix + navId;
-		}}
-
-		function setNavCollapsed(button, collapsed, persist = true) {{
-			const item = button.closest('.nav-item');
-			if (!item) {{
-				return;
-			}}
-			item.dataset.collapsed = collapsed ? 'true' : 'false';
-			button.setAttribute('aria-expanded', String(!collapsed));
-			const folderTitle = button.dataset.folderTitle || '';
-			button.setAttribute('aria-label', `${{collapsed ? '展开' : '折叠'}} ${{folderTitle}}`);
-			const icon = button.querySelector('span');
-			if (icon) {{
-				icon.textContent = collapsed ? '▸' : '▾';
-			}}
-			if (persist) {{
-				try {{
-					const navId = item.dataset.navId;
-					if (navId) {{
-						localStorage.setItem(navStateKey(navId), String(collapsed));
-					}}
-				}} catch (error) {{
-					void error;
-				}}
-			}}
-		}}
-
-		navItems.forEach((item) => {{
-			const button = item.querySelector('.nav-fold-toggle');
-			if (!button) {{
-				return;
-			}}
-			try {{
-				const stored = localStorage.getItem(navStateKey(item.dataset.navId || ''));
-				if (stored === 'true') {{
-					setNavCollapsed(button, true, false);
-				}} else {{
-					setNavCollapsed(button, false, false);
-				}}
-			}} catch (error) {{
-				void error;
-				setNavCollapsed(button, false, false);
-			}}
-		}});
-
-		document.querySelectorAll('.bookmark-favicon').forEach((img) => {{
-			img.addEventListener('error', () => {{
-				if (img.dataset.fallbackApplied === 'true') {{
-					return;
-				}}
-				img.dataset.fallbackApplied = 'true';
-				img.src = defaultIconSrc;
-				img.classList.add('is-default');
-			}});
-		}});
-
-		function updateVisibility() {{
-			const query = normalize(input.value);
-			let visibleFolders = 0;
-
-			folders.forEach((folder) => {{
-				const items = Array.from(folder.querySelectorAll('.bookmark-card'));
-				const folderMatch = normalize(folder.dataset.search).includes(query);
-				let bookmarkMatch = false;
-
-				items.forEach((item) => {{
-					const matched = query === '' || normalize(item.dataset.search).includes(query);
-					item.style.display = matched ? '' : 'none';
-					bookmarkMatch = bookmarkMatch || matched;
-				}});
-
-				const shouldShow = query === '' || folderMatch || bookmarkMatch;
-				folder.style.display = shouldShow ? '' : 'none';
-				folder.dataset.filtered = shouldShow ? 'false' : 'true';
-
-				if (query !== '') {{
-					folder.dataset.collapsed = shouldShow ? 'false' : 'true';
-				}}
-
-				if (shouldShow) visibleFolders += 1;
-			}});
-
-			document.getElementById('content').style.minHeight = visibleFolders ? 'auto' : '160px';
-			let empty = document.getElementById('emptyState');
-			if (!empty) {{
-				empty = document.createElement('div');
-				empty.id = 'emptyState';
-				empty.className = 'empty';
-				empty.textContent = '没有找到匹配的收藏，请尝试缩短关键词或切换搜索词。';
-				document.getElementById('content').appendChild(empty);
-			}}
-			empty.style.display = visibleFolders ? 'none' : 'block';
-		}}
-
-		input.addEventListener('input', updateVisibility);
-		webSearchForm.addEventListener('submit', (event) => {{
-			event.preventDefault();
-			const query = (webSearchInput.value || '').trim();
-			if (!query) {{
-				webSearchInput.focus();
-				return;
-			}}
-			const engine = webSearchEngine.value in webSearchUrls ? webSearchEngine.value : 'bing';
-			const targetUrl = webSearchUrls[engine] + encodeURIComponent(query);
-			window.open(targetUrl, '_blank', 'noopener,noreferrer');
-		}});
-
-		document.querySelectorAll('.folder-toggle').forEach((button) => {{
-			button.addEventListener('click', () => {{
-				const card = button.closest('.folder-card');
-				const collapsed = card.dataset.collapsed === 'true';
-				card.dataset.collapsed = collapsed ? 'false' : 'true';
-				button.setAttribute('aria-expanded', String(collapsed));
-				button.textContent = collapsed ? '收起' : '展开';
-			}});
-		}});
-
-		document.querySelectorAll('.nav-fold-toggle').forEach((button) => {{
-			button.addEventListener('click', () => {{
-				const item = button.closest('.nav-item');
-				if (!item) {{
-					return;
-				}}
-				const collapsed = item.dataset.collapsed === 'true';
-				setNavCollapsed(button, !collapsed);
-			}});
-		}});
-
-		updateVisibility();
-	</script>
+    <script>{self._get_js()}</script>
 </body>
-</html>"""
+</html>'''
+
+    def _count_folders(self, folder: BookmarkFolder) -> int:
+        """统计文件夹数量"""
+        count = 0
+        if folder.subfolders:
+            count += len(folder.subfolders)
+            for subfolder in folder.subfolders.values():
+                count += self._count_folders(subfolder)
+        return count
+
+    def _generate_nav_items(self, folder: BookmarkFolder, level: int = 0, parent_path: str = "") -> str:
+        """生成侧边栏导航项 - 按文件夹层级递归生成"""
+        if not folder.subfolders:
+            return ""
+
+        items = []
+
+        for name, subfolder in folder.subfolders.items():
+            current_path = f"{parent_path}/{name}" if parent_path else name
+            safe_id = self._make_id(current_path)
+            count = subfolder.count_bookmarks()
+            level_class = f"nav-level-{level}"
+
+            if subfolder.subfolders:
+                # 有子文件夹，添加折叠按钮
+                sub_nav = self._generate_nav_items(subfolder, level + 1, current_path)
+                items.append(f'''<li class="nav-item {level_class}">
+                    <div class="nav-item-header">
+                        <button class="toggle-btn" onclick="toggleNav(this)" aria-expanded="true">
+                            <span class="toggle-icon">▼</span>
+                        </button>
+                        <a href="#{safe_id}" onclick="highlightSection('{safe_id}')" title="{current_path}">{name}</a>
+                        <span class="bookmark-count">({count})</span>
+                    </div>
+                    {sub_nav}
+                </li>''')
+            else:
+                # 无子文件夹，普通链接
+                items.append(f'''<li class="nav-item {level_class}">
+                    <div class="nav-item-header nav-leaf">
+                        <a href="#{safe_id}" onclick="highlightSection('{safe_id}')" title="{current_path}">{name}</a>
+                        <span class="bookmark-count">({count})</span>
+                    </div>
+                </li>''')
+
+        if level == 0:
+            return "\n            ".join(items)
+        return f'<ul class="nav-sublist nav-level-{level}">\n                ' + "\n                ".join(items) + "\n            </ul>"
+
+    def _generate_content(self, folder: BookmarkFolder) -> str:
+        """生成主内容区域"""
+        sections = []
+
+        # 生成根目录书签（如果有）
+        if folder.bookmarks:
+            sections.append(self._generate_bookmarks_section("", folder.bookmarks))
+
+        # 生成子文件夹
+        for name, subfolder in folder.subfolders.items():
+            sections.append(self._generate_folder_section(name, subfolder))
+
+        return "\n\n".join(sections)
+
+    def _generate_folder_section(self, name: str, folder: BookmarkFolder, parent_path: str = "") -> str:
+        """生成单个文件夹的章节"""
+        current_path = f"{parent_path}/{name}" if parent_path else name
+        safe_id = self._make_id(current_path)
+        breadcrumb = f" {parent_path} ›" if parent_path else ""
+
+        section = f'''
+        <section id="{safe_id}" class="folder-section">
+            <h2 class="folder-title">📂 {self._escape_html(name)}<small class="breadcrumb">{breadcrumb}</small></h2>
+            <p class="folder-meta">包含 {len(folder.bookmarks)} 个书签</p>
+            {self._generate_bookmarks_grid(folder.bookmarks)}
+        '''
+
+        # 递归生成子文件夹
+        for sub_name, subfolder in folder.subfolders.items():
+            section += self._generate_folder_section(sub_name, subfolder, current_path)
+
+        section += "\n        </section>"
+        return section
+
+    def _generate_bookmarks_section(self, title: str, bookmarks: List[Bookmark]) -> str:
+        """生成书签列表"""
+        if not bookmarks:
+            return ""
+
+        header = f'<h2 class="folder-title">🔗 {title or "未分类书签"}</h2>' if title else ""
+        return f'''
+        <section class="folder-section">
+            {header}
+            {self._generate_bookmarks_grid(bookmarks)}
+        </section>'''
+
+    def _generate_bookmarks_grid(self, bookmarks: List[Bookmark]) -> str:
+        """生成书签网格"""
+        return f'<div class="bookmarks-grid">\n' + "\n".join(
+            self._generate_bookmark_card(bm) for bm in bookmarks
+        ) + "\n        </div>"
+
+    def _generate_bookmark_card(self, bookmark: Bookmark) -> str:
+        """生成单个书签卡片"""
+        return f'''        <div class="bookmark-card" data-title="{bookmark.title.lower()}" data-url="{bookmark.url.lower()}">
+            <div class="bookmark-icon">
+                <img src="https://www.google.com/s2/favicons?domain={bookmark.domain}&sz=64"
+                     alt="" onerror="this.src='data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 24 24%22 fill=%22%23999%22><path d=%22M5 5v14h14V5H5zm12 12H7V7h10v10z%22/></svg>'">
+            </div>
+            <div class="bookmark-info">
+                <a href="{bookmark.url}" target="_blank" class="bookmark-title">{self._escape_html(bookmark.title)}</a>
+                <span class="bookmark-url">{bookmark.domain}</span>
+            </div>
+        </div>'''
+
+    def _make_id(self, text: str) -> str:
+        """生成安全的 HTML ID"""
+        return re.sub(r'[^\w一-鿿-]', '_', text)
+
+    def _escape_html(self, text: str) -> str:
+        """转义 HTML 特殊字符"""
+        return html.escape(text)
+
+    def _get_css(self) -> str:
+        """获取 CSS 样式"""
+        return '''
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, "Microsoft YaHei", sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            height: 100vh;
+            margin: 0;
+            padding: 10px;
+            color: #333;
+            overflow: hidden;
+        }
+
+        .container {
+            max-width: 1400px;
+            width: 100%;
+            height: 100%;
+            margin: 0 auto;
+            background: white;
+            border-radius: 12px;
+            box-shadow: 0 10px 40px rgba(0,0,0,0.3);
+            overflow: hidden;
+            display: grid;
+            grid-template-rows: auto 1fr;
+        }
+
+        header {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 8px 20px;
+        }
+
+        .header-top {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 8px;
+        }
+
+        header h1 {
+            font-size: 1.2rem;
+            margin: 0;
+            text-shadow: 2px 2px 4px rgba(0,0,0,0.2);
+        }
+
+        .stats {
+            display: flex;
+            gap: 8px;
+        }
+
+        .stat-item {
+            background: rgba(255,255,255,0.2);
+            padding: 3px 8px;
+            border-radius: 10px;
+            font-size: 0.7rem;
+        }
+
+        /* 网页搜索容器 */
+        .web-search-container {
+            max-width: 600px;
+            margin: 0 auto 6px;
+        }
+
+        .web-search-box {
+            display: flex;
+            gap: 8px;
+            align-items: center;
+        }
+
+        .engine-select {
+            background: white;
+            color: #667eea;
+            border: none;
+            padding: 6px 10px;
+            border-radius: 18px 0 0 18px;
+            cursor: pointer;
+            font-size: 0.8rem;
+            font-weight: 600;
+            outline: none;
+            flex-shrink: 0;
+        }
+
+        .web-search-box input {
+            flex: 1;
+            padding: 6px 12px;
+            border: none;
+            font-size: 0.85rem;
+            outline: none;
+            background: rgba(255,255,255,0.2);
+            color: white;
+        }
+
+        .web-search-box input::placeholder {
+            color: rgba(255,255,255,0.7);
+        }
+
+        .web-search-box input:focus {
+            background: rgba(255,255,255,0.3);
+        }
+
+        .search-btn {
+            background: white;
+            color: #667eea;
+            border: none;
+            padding: 6px 14px;
+            border-radius: 18px;
+            cursor: pointer;
+            font-size: 0.85rem;
+            transition: all 0.2s;
+        }
+
+        .search-btn:hover {
+            transform: scale(1.05);
+            box-shadow: 0 2px 10px rgba(0,0,0,0.2);
+        }
+
+        /* 书签搜索框 */
+        .bookmark-search-box {
+            position: relative;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            margin-top: 5px;
+        }
+
+        .bookmark-search-box input {
+            width: 100%;
+            max-width: 400px;
+            padding: 5px 30px 5px 12px;
+            border: none;
+            border-radius: 12px;
+            font-size: 0.8rem;
+            outline: none;
+            background: rgba(255,255,255,0.2);
+            color: white;
+            box-shadow: none;
+        }
+
+        .bookmark-search-box input::placeholder {
+            color: rgba(255,255,255,0.7);
+        }
+
+        .bookmark-search-box input:focus {
+            background: rgba(255,255,255,0.3);
+        }
+
+        .clear-btn {
+            position: absolute;
+            right: calc(50% - 175px);
+            background: rgba(255,255,255,0.3);
+            border: none;
+            width: 18px;
+            height: 18px;
+            border-radius: 50%;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 11px;
+            transition: background 0.2s;
+        }
+
+        .clear-btn:hover {
+            background: rgba(255,255,255,0.5);
+        }
+
+        .layout-wrapper {
+            display: grid;
+            grid-template-columns: 300px 1fr;
+            min-height: 0;
+        }
+
+        .sidebar {
+            background: #f8f9fa;
+            border-right: 1px solid #e9ecef;
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+        }
+
+        .sidebar-header {
+            padding: 10px 15px 8px;
+            border-bottom: 1px solid #e9ecef;
+            display: flex;
+            flex-direction: column;
+            gap: 6px;
+        }
+
+        .sidebar-header h3 {
+            font-size: 0.9rem;
+            color: #495057;
+            margin: 0;
+        }
+
+        .sidebar-header button {
+            background: none;
+            border: 1px solid #dee2e6;
+            padding: 3px 8px;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 0.7rem;
+            color: #6c757d;
+            transition: all 0.2s;
+        }
+
+        .sidebar-header button:hover {
+            background: #e9ecef;
+            color: #495057;
+        }
+
+        .nav-list {
+            list-style: none;
+            overflow-y: auto;
+            flex: 1;
+            padding: 8px;
+        }
+
+        .nav-item {
+            margin-bottom: 1px;
+            position: relative;
+        }
+
+        .nav-item-header {
+            display: flex;
+            align-items: center;
+            gap: 4px;
+            padding: 3px 6px;
+            padding-left: 10px;
+            border-radius: 5px;
+            transition: background 0.2s;
+        }
+
+        /* 叶子节点（无子文件夹）的左边距 */
+        .nav-item-header.nav-leaf {
+            padding-left: 26px;
+        }
+
+        /* 层级缩进 */
+        .nav-level-0 > .nav-item > .nav-item-header {
+            padding-left: 6px;
+        }
+
+        .nav-level-1 > .nav-item > .nav-item-header {
+            padding-left: 6px;
+        }
+
+        .nav-level-1 > .nav-item > .nav-item-header.nav-leaf {
+            padding-left: 22px;
+        }
+
+        .nav-level-2 > .nav-item > .nav-item-header {
+            padding-left: 6px;
+        }
+
+        .nav-level-2 > .nav-item > .nav-item-header.nav-leaf {
+            padding-left: 22px;
+        }
+
+        .nav-item-header:hover {
+            background: #e9ecef;
+        }
+
+        .toggle-btn {
+            background: none;
+            border: none;
+            cursor: pointer;
+            padding: 0;
+            width: 16px;
+            height: 16px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            flex-shrink: 0;
+            transition: transform 0.2s;
+        }
+
+        .toggle-btn .toggle-icon {
+            font-size: 9px;
+            color: #6c757d;
+            transition: transform 0.2s;
+        }
+
+        .toggle-btn[aria-expanded="false"] .toggle-icon {
+            transform: rotate(-90deg);
+        }
+
+        .nav-spacer {
+            width: 18px;
+            flex-shrink: 0;
+        }
+
+        .nav-list a {
+            color: #495057;
+            text-decoration: none;
+            flex: 1;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+            font-size: 0.85rem;
+        }
+
+        .nav-list a:hover {
+            color: #667eea;
+        }
+
+        .bookmark-count {
+            color: #adb5bd;
+            font-size: 0.7rem;
+            flex-shrink: 0;
+        }
+
+        .nav-sublist {
+            list-style: none;
+            padding-left: 16px;
+            overflow: hidden;
+            transition: max-height 0.3s ease-out, opacity 0.2s ease-out;
+            max-height: 5000px;
+            opacity: 1;
+        }
+
+        .nav-sublist.collapsed {
+            max-height: 0;
+            opacity: 0;
+        }
+
+        /* 层级显示样式 */
+        .nav-level-0 .nav-item-header {
+            font-weight: 600;
+            font-size: 0.85rem;
+        }
+
+        .nav-level-1 .nav-item-header {
+            font-weight: 500;
+            font-size: 0.8rem;
+        }
+
+        .nav-level-2 .nav-item-header,
+        .nav-level-3 .nav-item-header {
+            font-weight: 400;
+            font-size: 0.78rem;
+        }
+
+        /* 子层级左侧边框线 */
+        .nav-sublist {
+            position: relative;
+        }
+
+        .nav-sublist::before {
+            content: '';
+            position: absolute;
+            left: 6px;
+            top: 4px;
+            bottom: 4px;
+            width: 1px;
+            background: #dee2e6;
+        }
+
+        .nav-sublist .nav-item::before {
+            content: '';
+            position: absolute;
+            left: 6px;
+            top: 50%;
+            width: 6px;
+            height: 1px;
+            background: #dee2e6;
+        }
+
+        .nav-sublist .nav-item:last-child::after {
+            content: '';
+            position: absolute;
+            left: 6px;
+            top: 50%;
+            bottom: 0;
+            width: 1px;
+            background: white;
+        }
+
+        .content {
+            padding: 15px 20px;
+            overflow-y: auto;
+            overflow-x: hidden;
+        }
+
+        /* 搜索结果样式 */
+        .search-results {
+            background: #f8f9fa;
+            border-radius: 10px;
+            padding: 15px;
+            margin-bottom: 20px;
+            border: 2px solid #667eea;
+        }
+
+        .search-results-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 15px;
+            padding-bottom: 10px;
+            border-bottom: 1px solid #e9ecef;
+        }
+
+        .search-results-header h2 {
+            font-size: 1.1rem;
+            color: #667eea;
+        }
+
+        .search-results-header button {
+            background: white;
+            border: 1px solid #dee2e6;
+            padding: 6px 12px;
+            border-radius: 6px;
+            cursor: pointer;
+            transition: all 0.2s;
+            font-size: 0.85rem;
+        }
+
+        .search-results-header button:hover {
+            background: #e9ecef;
+        }
+
+        .search-results-content {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+            gap: 12px;
+        }
+
+        .search-result-item {
+            background: white;
+            border-radius: 8px;
+            padding: 12px;
+            border: 1px solid #e9ecef;
+            transition: all 0.2s;
+        }
+
+        .search-result-item:hover {
+            box-shadow: 0 4px 15px rgba(0,0,0,0.1);
+            border-color: #667eea;
+        }
+
+        .search-result-item.match-title {
+            border-left: 4px solid #28a745;
+        }
+
+        .search-result-item.match-url {
+            border-left: 4px solid #ffc107;
+        }
+
+        .search-result-folder {
+            font-size: 0.7rem;
+            color: #6c757d;
+            margin-bottom: 6px;
+            display: flex;
+            align-items: center;
+            gap: 4px;
+        }
+
+        .search-result-folder::before {
+            content: "📁";
+        }
+
+        .folder-section {
+            margin-bottom: 25px;
+            scroll-margin-top: 10px;
+        }
+
+        .folder-section.highlight {
+            animation: highlight 2s ease-out;
+        }
+
+        @keyframes highlight {
+            0% { background: rgba(102, 126, 234, 0.2); }
+            100% { background: transparent; }
+        }
+
+        .folder-title {
+            font-size: 1.2rem;
+            color: #495057;
+            margin-bottom: 8px;
+            padding-bottom: 8px;
+            border-bottom: 2px solid #e9ecef;
+        }
+
+        .folder-title .breadcrumb {
+            font-size: 0.75rem;
+            color: #adb5bd;
+            font-weight: 400;
+            margin-left: 8px;
+        }
+
+        .folder-meta {
+            color: #6c757d;
+            font-size: 0.8rem;
+            margin-bottom: 12px;
+        }
+
+        .bookmarks-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+            gap: 12px;
+        }
+
+        .bookmark-card {
+            display: flex;
+            align-items: center;
+            padding: 10px 12px;
+            background: #f8f9fa;
+            border-radius: 8px;
+            transition: all 0.3s;
+            text-decoration: none;
+            border: 1px solid transparent;
+        }
+
+        .bookmark-card:hover {
+            background: white;
+            box-shadow: 0 4px 15px rgba(0,0,0,0.1);
+            transform: translateY(-2px);
+            border-color: #667eea;
+        }
+
+        .bookmark-icon {
+            width: 32px;
+            height: 32px;
+            flex-shrink: 0;
+            margin-right: 10px;
+        }
+
+        .bookmark-icon img {
+            width: 24px;
+            height: 24px;
+            border-radius: 5px;
+        }
+
+        .bookmark-info {
+            flex: 1;
+            min-width: 0;
+        }
+
+        .bookmark-title {
+            color: #212529;
+            text-decoration: none;
+            font-weight: 500;
+            font-size: 0.9rem;
+            display: block;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+
+        .bookmark-title:hover {
+            color: #667eea;
+        }
+
+        .bookmark-url {
+            color: #6c757d;
+            font-size: 0.75rem;
+            display: block;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+
+        @media (max-width: 768px) {
+            body {
+                padding: 5px;
+            }
+            .container {
+                border-radius: 8px;
+            }
+            .layout-wrapper {
+                grid-template-columns: 1fr;
+            }
+            .sidebar {
+                max-height: 150px;
+                border-right: none;
+                border-bottom: 1px solid #e9ecef;
+            }
+            .bookmarks-grid, .search-results-content {
+                grid-template-columns: 1fr;
+            }
+            .header-top {
+                flex-direction: column;
+                gap: 6px;
+                text-align: center;
+            }
+            .stats {
+                justify-content: center;
+            }
+            .web-search-container {
+                max-width: 100%;
+            }
+            .engine-select {
+                flex-shrink: 0;
+                min-width: 70px;
+            }
+            .content {
+                padding: 12px;
+            }
+        }
+
+        @media print {
+            body { background: white; padding: 0; }
+            .container { box-shadow: none; border-radius: 0; }
+            .sidebar, .web-search-container, .bookmark-search-box { display: none; }
+            .bookmark-card { break-inside: avoid; }
+            .search-results { page-break-before: always; }
+        }
+        '''
+
+    def _get_js(self) -> str:
+        """获取 JavaScript 代码"""
+        return '''
+        // 搜索引擎配置
+        const searchEngines = {
+            google: {
+                name: '谷歌',
+                url: 'https://www.google.com/search?q=',
+                placeholder: '🌐 谷歌搜索...'
+            },
+            bing: {
+                name: '必应',
+                url: 'https://www.bing.com/search?q=',
+                placeholder: '🌐 必应搜索...'
+            },
+            baidu: {
+                name: '百度',
+                url: 'https://www.baidu.com/s?wd=',
+                placeholder: '🌐 百度搜索...'
+            },
+            sogou: {
+                name: '搜狗',
+                url: 'https://www.sogou.com/web?query=',
+                placeholder: '🌐 搜狗搜索...'
+            },
+            duckduckgo: {
+                name: 'DuckDuckGo',
+                url: 'https://duckduckgo.com/?q=',
+                placeholder: '🌐 DuckDuckGo 搜索...'
+            }
+        };
+
+        let currentEngine = 'google';
+
+        // 切换搜索引擎
+        function switchEngine(engine) {
+            currentEngine = engine;
+            document.getElementById('engineSelect').value = engine;
+            const input = document.getElementById('webSearchInput');
+            input.placeholder = searchEngines[engine].placeholder;
+            input.focus();
+        }
+
+        // 处理网页搜索回车键
+        function handleWebSearchKeypress(event) {
+            if (event.key === 'Enter') {
+                performWebSearch();
+            }
+        }
+
+        // 执行网页搜索
+        function performWebSearch() {
+            const query = document.getElementById('webSearchInput').value.trim();
+            if (query) {
+                const engine = searchEngines[currentEngine];
+                const searchUrl = engine.url + encodeURIComponent(query);
+                window.open(searchUrl, '_blank');
+            }
+        }
+
+        // 存储所有书签数据用于搜索
+        const allBookmarks = [];
+
+        // 初始化：收集所有书签数据
+        function initBookmarks() {
+            document.querySelectorAll('.bookmark-card').forEach(card => {
+                const titleEl = card.querySelector('.bookmark-title');
+                const folderSection = card.closest('.folder-section');
+                allBookmarks.push({
+                    title: titleEl ? titleEl.textContent : '',
+                    url: card.dataset.url || '',
+                    domain: card.dataset.url ? new URL(card.dataset.url).hostname : '',
+                    folder: folderSection ? folderSection.querySelector('.folder-title')?.firstChild?.textContent || '' : '',
+                    element: card.outerHTML
+                });
+            });
+        }
+
+        // 搜索处理
+        function handleSearch(query) {
+            const searchResults = document.getElementById('searchResults');
+            const searchResultsContent = document.getElementById('searchResultsContent');
+            const mainContent = document.getElementById('mainContent');
+            const clearBtn = document.getElementById('clearSearch');
+
+            if (!query.trim()) {
+                searchResults.style.display = 'none';
+                mainContent.style.display = 'block';
+                clearBtn.style.display = 'none';
+                return;
+            }
+
+            const lowerQuery = query.toLowerCase();
+            const results = allBookmarks.filter(bm =>
+                bm.title.toLowerCase().includes(lowerQuery) ||
+                bm.url.toLowerCase().includes(lowerQuery) ||
+                bm.domain.toLowerCase().includes(lowerQuery)
+            );
+
+            searchResultsContent.innerHTML = '';
+
+            if (results.length === 0) {
+                searchResultsContent.innerHTML = '<p style="grid-column: 1/-1; text-align: center; color: #6c757d; padding: 40px;">未找到匹配的书签</p>';
+            } else {
+                results.forEach(bm => {
+                    const matchType = bm.title.toLowerCase().includes(lowerQuery) ? 'match-title' : 'match-url';
+                    const div = document.createElement('div');
+                    div.className = `search-result-item ${matchType}`;
+                    div.innerHTML = `
+                        <div class="search-result-folder">${bm.folder}</div>
+                        ${bm.element}
+                    `;
+                    searchResultsContent.appendChild(div);
+                });
+            }
+
+            searchResults.style.display = 'block';
+            mainContent.style.display = 'none';
+            clearBtn.style.display = 'flex';
+        }
+
+        // 清除搜索
+        function clearSearch() {
+            const searchInput = document.getElementById('searchInput');
+            searchInput.value = '';
+            handleSearch('');
+        }
+
+        // 导航折叠/展开
+        function toggleNav(btn) {
+            const isExpanded = btn.getAttribute('aria-expanded') === 'true';
+            btn.setAttribute('aria-expanded', !isExpanded);
+
+            const sublist = btn.closest('.nav-item').querySelector('.nav-sublist');
+            if (sublist) {
+                sublist.classList.toggle('collapsed', isExpanded);
+            }
+        }
+
+        // 全部折叠
+        function collapseAllNav() {
+            document.querySelectorAll('.toggle-btn[aria-expanded="true"]').forEach(btn => {
+                btn.setAttribute('aria-expanded', 'false');
+                const sublist = btn.closest('.nav-item').querySelector('.nav-sublist');
+                if (sublist) sublist.classList.add('collapsed');
+            });
+        }
+
+        // 全部展开
+        function expandAllNav() {
+            document.querySelectorAll('.toggle-btn[aria-expanded="false"]').forEach(btn => {
+                btn.setAttribute('aria-expanded', 'true');
+                const sublist = btn.closest('.nav-item').querySelector('.nav-sublist');
+                if (sublist) sublist.classList.remove('collapsed');
+            });
+        }
+
+        // 高亮章节
+        function highlightSection(id) {
+            setTimeout(() => {
+                const section = document.getElementById(id);
+                if (section) {
+                    section.classList.remove('highlight');
+                    void section.offsetWidth; // 触发重排
+                    section.classList.add('highlight');
+                }
+            }, 100);
+        }
+
+        // 平滑滚动
+        document.querySelectorAll('a[href^="#"]').forEach(anchor => {
+            anchor.addEventListener('click', function(e) {
+                const href = this.getAttribute('href');
+                if (href !== '#') {
+                    e.preventDefault();
+                    const target = document.querySelector(href);
+                    if (target) {
+                        target.scrollIntoView({ behavior: 'smooth', block: 'start' });
+                    }
+                }
+            });
+        });
+
+        // 键盘快捷键
+        document.addEventListener('keydown', function(e) {
+            // ESC 清除搜索
+            if (e.key === 'Escape') {
+                clearSearch();
+            }
+            // / 聚焦搜索框
+            if (e.key === '/' && !e.ctrlKey && !e.metaKey) {
+                const searchInput = document.getElementById('searchInput');
+                if (document.activeElement !== searchInput) {
+                    e.preventDefault();
+                    searchInput.focus();
+                }
+            }
+        });
+
+        // 初始化
+        document.addEventListener('DOMContentLoaded', initBookmarks);
+        '''
 
 
-def main() -> None:
-	base_dir = Path(__file__).resolve().parent
-	source_path = base_dir / "data.html"
-	output_path = base_dir / "favorites_navigation.html"
+def convert_bookmarks(input_file: str, output_file: str, title: str = "我的书签"):
+    """
+    转换浏览器书签文件
 
-	root = parse_bookmarks(source_path)
-	html = build_html(root, source_path.name)
-	output_path.write_text(html, encoding="utf-8")
-	print(f"generated: {output_path}")
+    Args:
+        input_file: 输入的书签 HTML 文件路径
+        output_file: 输出的静态网页文件路径
+        title: 网页标题
+    """
+    input_path = Path(input_file)
+
+    if not input_path.exists():
+        raise FileNotFoundError(f"找不到文件: {input_file}")
+
+    # 读取输入文件
+    print(f"📖 正在读取书签文件: {input_file}")
+    html_content = input_path.read_text(encoding='utf-8')
+
+    # 解析书签
+    print("🔍 正在解析书签结构...")
+    parser = BookmarkParser(html_content)
+    folder_tree = parser.parse()
+
+    # 生成静态网页
+    print(f"📝 正在生成静态网页...")
+    generator = StaticPageGenerator(folder_tree, title=title)
+    generator.generate(output_file)
+
+    print(f"✅ 转换完成！")
+    print(f"   文件夹数: {generator._count_folders(folder_tree)}")
+    print(f"   书签数: {generator.total_bookmarks}")
+    print(f"   输出文件: {output_file}")
 
 
 if __name__ == "__main__":
-	main()
+    import sys
+
+    if len(sys.argv) < 2:
+        print("""
+📚 浏览器书签转换工具
+
+使用方法:
+  python main.py <输入文件> [输出文件] [标题]
+
+参数说明:
+  输入文件  - 浏览器导出的书签 HTML 文件路径
+  输出文件  - 生成的静态网页文件路径 (默认: bookmarks.html)
+  标题      - 网页标题 (默认: "我的书签")
+
+示例:
+  python main.py bookmarks.html
+  python main.py edge_bookmarks.html my_bookmarks.html
+  python main.py chrome.html output.html "我的Chrome书签"
+        """)
+        sys.exit(1)
+
+    input_file = sys.argv[1]
+    output_file = sys.argv[2] if len(sys.argv) > 2 else "data.html"
+    title = sys.argv[3] if len(sys.argv) > 3 else "我的书签"
+
+    try:
+        convert_bookmarks(input_file, output_file, title)
+    except Exception as e:
+        print(f"❌ 错误: {e}")
+        sys.exit(1)
